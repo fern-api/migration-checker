@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# macOS
+.DS_Store
+
+# Generated reports
+migration-report-*.html
+migration-report-live.html
+
+# Cache
+migration-cache.json
+
+# Generated output
+llm-output/
+screenshots/
+redirects-*.mdx
+migration-data.json
+migration-report-*.html
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*

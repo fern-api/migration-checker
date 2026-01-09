@@ -1,0 +1,14 @@
+{
+  "name": "docs-migration-analyzer",
+  "version": "1.0.0",
+  "description": "Automated analysis tool for comparing documentation sites during migration",
+  "main": "analyze.js",
+  "scripts": {
+    "analyze": "node analyze.js",
+    "analyze:full": "node analyze.js \"\" \"\" \"\" \"\" --full"
+  },
+  "dependencies": {
+    "puppeteer": "^24.34.0",
+    "xml2js": "^0.6.2"
+  }
+}
