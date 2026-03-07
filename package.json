@@ -5,9 +5,14 @@
   "main": "analyze.js",
   "scripts": {
     "analyze": "node analyze.js",
-    "analyze:full": "node analyze.js \"\" \"\" \"\" \"\" --full"
+    "analyze:full": "node analyze.js \"\" \"\" \"\" \"\" --full",
+    "upgrade-diff": "node upgrade-diff.js",
+    "upgrade-diff:ci": "node upgrade-diff.js --ci"
   },
   "dependencies": {
+    "diff": "^7.0.0",
+    "pixelmatch": "^6.0.0",
+    "pngjs": "^7.0.0",
     "puppeteer": "^24.34.0",
     "xml2js": "^0.6.2"
   }

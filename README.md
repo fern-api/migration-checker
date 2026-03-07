@@ -144,3 +144,101 @@ Generates a ready-to-use redirects configuration:
   2. **Needs Review**: Redirects with heading mismatches
   3. **Missing Redirects**: 404s that need destinations
 - Includes implementation snippets for Fern (`fern.config.yml`)
+
+---
+
+## Upgrade Diff Tool
+
+Visual, structural, and text comparison between two versions of a docs site (e.g. production vs preview).
+
+### Usage
+
+```bash
+node upgrade-diff.js <production-url> <preview-url> [sitemap-url] [options]
+```
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--filter=<pattern>` | Only check pages matching this path pattern | (all pages) |
+| `--concurrency=<n>` | Number of parallel comparisons | `10` |
+| `--explorer[=<pattern>]` | Append `?explorer` to pages | off |
+| `--diff-threshold=<n>` | Pixel diff % threshold for embedding images in report | `2` |
+| `--check-header` | Include header elements in comparisons | off (stripped) |
+| `--check-sidebar` | Include sidebar elements in comparisons | off (stripped) |
+| `--check-footer` | Include footer elements in comparisons | off (stripped) |
+| `--share` | Regenerate shareable report from existing data | — |
+| `--ci` | Write CI summary JSON for GitHub Actions | off |
+
+### Examples
+
+```bash
+# Basic comparison
+node upgrade-diff.js https://docs.example.com https://preview.example.com
+
+# Only API reference pages, with header/sidebar included
+node upgrade-diff.js https://docs.example.com https://preview.example.com \
+  --filter=/api-reference --check-header --check-sidebar
+
+# Lower threshold to catch smaller visual regressions
+node upgrade-diff.js https://docs.example.com https://preview.example.com \
+  --diff-threshold=1
+
+# Regenerate shareable report from last run
+node upgrade-diff.js --share
+```
+
+### Component Check Flags
+
+By default, the tool strips headers, sidebars, and footers from comparisons to focus on page content. Use the `--check-*` flags to include them:
+
+- `--check-header` keeps: `header`, `[role="banner"]`, `.header`
+- `--check-sidebar` keeps: `.sidebar`
+- `--check-footer` keeps: `footer`, `[role="contentinfo"]`, `.footer`
+
+### GitHub Action
+
+This tool can run as a GitHub Action on pull requests. Add it to your workflow:
+
+```yaml
+# .github/workflows/docs-diff.yml
+name: Docs Diff
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  docs-diff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          production-url: ${{ vars.DOCS_PRODUCTION_URL }}
+          preview-url: ${{ vars.DOCS_PREVIEW_URL }}
+```
+
+**Required repository variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `DOCS_PRODUCTION_URL` | Production docs URL |
+| `DOCS_PREVIEW_URL` | Preview/staging docs URL |
+
+**Optional repository variables:**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DOCS_DIFF_FILTER` | Path filter pattern | (all pages) |
+| `DOCS_DIFF_CONCURRENCY` | Parallel comparisons | `10` |
+| `DOCS_DIFF_THRESHOLD` | Pixel diff threshold | `2` |
+| `DOCS_CHECK_HEADER` | Include header | `false` |
+| `DOCS_CHECK_SIDEBAR` | Include sidebar | `false` |
+| `DOCS_CHECK_FOOTER` | Include footer | `false` |
+
+The action posts a summary comment on the PR with a table of changes and a link to the full HTML report artifact.
