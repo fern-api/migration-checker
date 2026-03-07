@@ -1,0 +1,174 @@
+name: 'Docs Migration Diff'
+description: 'Compare documentation sites and report visual/structural/text differences'
+
+inputs:
+  production-url:
+    description: 'Production docs URL (e.g. https://docs.example.com)'
+    required: true
+  preview-url:
+    description: 'Preview/staging docs URL to compare against production'
+    required: true
+  sitemap-url:
+    description: 'Custom sitemap URL (defaults to production-url/sitemap.xml)'
+    required: false
+    default: ''
+  filter:
+    description: 'Only check pages matching this path pattern (e.g. /api-reference)'
+    required: false
+    default: ''
+  concurrency:
+    description: 'Number of parallel page comparisons'
+    required: false
+    default: '10'
+  diff-threshold:
+    description: 'Pixel diff percentage threshold for embedding images in report'
+    required: false
+    default: '2'
+  check-header:
+    description: 'Include header elements in comparisons'
+    required: false
+    default: 'false'
+  check-sidebar:
+    description: 'Include sidebar elements in comparisons'
+    required: false
+    default: 'false'
+  check-footer:
+    description: 'Include footer elements in comparisons'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+      working-directory: ${{ github.action_path }}
+
+    - name: Run docs diff
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        ARGS="${{ inputs.production-url }} ${{ inputs.preview-url }}"
+
+        if [ -n "${{ inputs.sitemap-url }}" ]; then
+          ARGS="$ARGS ${{ inputs.sitemap-url }}"
+        fi
+
+        if [ -n "${{ inputs.filter }}" ]; then
+          ARGS="$ARGS --filter=${{ inputs.filter }}"
+        fi
+
+        ARGS="$ARGS --concurrency=${{ inputs.concurrency }}"
+        ARGS="$ARGS --diff-threshold=${{ inputs.diff-threshold }}"
+
+        if [ "${{ inputs.check-header }}" = "true" ]; then
+          ARGS="$ARGS --check-header"
+        fi
+
+        if [ "${{ inputs.check-sidebar }}" = "true" ]; then
+          ARGS="$ARGS --check-sidebar"
+        fi
+
+        if [ "${{ inputs.check-footer }}" = "true" ]; then
+          ARGS="$ARGS --check-footer"
+        fi
+
+        ARGS="$ARGS --ci"
+
+        node upgrade-diff.js $ARGS
+
+    - name: Upload report artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: docs-diff-report
+        path: |
+          ${{ github.action_path }}/upgrade-diff-share-*.html
+          ${{ github.action_path }}/upgrade-diff-ci-summary.json
+        retention-days: 30
+
+    - name: Comment on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+
+          // Read CI summary
+          const summaryFiles = fs.readdirSync('${{ github.action_path }}')
+            .filter(f => f === 'upgrade-diff-ci-summary.json');
+
+          if (summaryFiles.length === 0) {
+            core.warning('No CI summary found — skipping PR comment');
+            return;
+          }
+
+          const summary = JSON.parse(
+            fs.readFileSync(path.join('${{ github.action_path }}', summaryFiles[0]), 'utf8')
+          );
+
+          const { counts, changedPages } = summary;
+          const total = counts.total;
+          const hasChanges = counts.structureChanged + counts.textChanged > 0;
+
+          // Build summary table
+          let body = `## Docs Diff Report\n\n`;
+          body += `| Category | Count |\n`;
+          body += `|----------|-------|\n`;
+          body += `| Structure Changed | ${counts.structureChanged} |\n`;
+          body += `| Text Changed | ${counts.textChanged} |\n`;
+          body += `| Unchanged | ${counts.unchanged} |\n`;
+          body += `| Errors | ${counts.error} |\n`;
+          body += `| **Total** | **${total}** |\n\n`;
+
+          if (hasChanges && changedPages.length > 0) {
+            body += `### Changed Pages\n\n`;
+            body += `| Page | Status | Pixel Diff |\n`;
+            body += `|------|--------|------------|\n`;
+            for (const p of changedPages.slice(0, 50)) {
+              const diff = p.diffPercent !== null ? `${p.diffPercent}%` : 'N/A';
+              const status = p.classification === 'structure-changed' ? '🔴 Structure' : '🟡 Text';
+              body += `| \`${p.path}\` | ${status} | ${diff} |\n`;
+            }
+            if (changedPages.length > 50) {
+              body += `\n_...and ${changedPages.length - 50} more pages_\n`;
+            }
+            body += '\n';
+          }
+
+          body += `📎 Full HTML report available as a [build artifact](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
+
+          // Find and update existing comment or create new one
+          const marker = '<!-- docs-diff-report -->';
+          body = marker + '\n' + body;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const existing = comments.find(c => c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+          }

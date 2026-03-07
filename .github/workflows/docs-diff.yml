@@ -1,0 +1,33 @@
+name: Docs Diff
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Cancel in-progress runs for the same PR
+concurrency:
+  group: docs-diff-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  docs-diff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Docs Diff
+        uses: ./
+        with:
+          production-url: ${{ vars.DOCS_PRODUCTION_URL }}
+          preview-url: ${{ vars.DOCS_PREVIEW_URL }}
+          filter: ${{ vars.DOCS_DIFF_FILTER || '' }}
+          concurrency: ${{ vars.DOCS_DIFF_CONCURRENCY || '10' }}
+          diff-threshold: ${{ vars.DOCS_DIFF_THRESHOLD || '2' }}
+          check-header: ${{ vars.DOCS_CHECK_HEADER || 'false' }}
+          check-sidebar: ${{ vars.DOCS_CHECK_SIDEBAR || 'false' }}
+          check-footer: ${{ vars.DOCS_CHECK_FOOTER || 'false' }}
