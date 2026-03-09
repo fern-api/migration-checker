@@ -23,11 +23,12 @@ jobs:
       - name: Run Docs Diff
         uses: ./
         with:
-          production-url: ${{ vars.DOCS_PRODUCTION_URL }}
-          preview-url: ${{ vars.DOCS_PREVIEW_URL }}
-          filter: ${{ vars.DOCS_DIFF_FILTER || '' }}
-          concurrency: ${{ vars.DOCS_DIFF_CONCURRENCY || '10' }}
-          diff-threshold: ${{ vars.DOCS_DIFF_THRESHOLD || '2' }}
-          check-header: ${{ vars.DOCS_CHECK_HEADER || 'false' }}
-          check-sidebar: ${{ vars.DOCS_CHECK_SIDEBAR || 'false' }}
-          check-footer: ${{ vars.DOCS_CHECK_FOOTER || 'false' }}
+          production-url: https://developers.webflow.com  # Change to your production docs URL
+          fern-token: ${{ secrets.FERN_TOKEN }}
+          # preview-url: ''  # Leave empty to auto-generate via Fern CLI
+          # filter: '/api-reference'
+          # concurrency: '10'
+          # diff-threshold: '2'
+          # check-header: 'false'
+          # check-sidebar: 'false'
+          # check-footer: 'false'

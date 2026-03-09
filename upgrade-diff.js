@@ -25,7 +25,7 @@ let PROD_URL = (positional[0] || '').replace(/\/$/, '');
 let PREVIEW_URL = (positional[1] || '').replace(/\/$/, '');
 const SITEMAP_URL = positional[2] || null;
 const FILTER = flags.filter || null;
-const CONCURRENCY = parseInt(flags.concurrency, 10) || 10;
+const CONCURRENCY = parseInt(flags.concurrency, 10) || 5;
 // --explorer with no value = apply to all filtered pages
 // --explorer=/reference = only add ?explorer to pages matching this pattern
 const EXPLORER = flags.explorer !== undefined ? (flags.explorer === true ? '' : flags.explorer) : null;
@@ -40,7 +40,7 @@ if (!flags.share && (!PROD_URL || !PREVIEW_URL)) {
   console.error('');
   console.error('Options:');
   console.error('  --filter=<pattern>       Only check pages matching this path pattern');
-  console.error('  --concurrency=<n>        Number of parallel comparisons (default: 10)');
+  console.error('  --concurrency=<n>        Number of parallel comparisons (default: 5)');
   console.error('  --explorer[=<pattern>]   Append ?explorer to pages (optionally filtered)');
   console.error('  --diff-threshold=<n>     Pixel diff % to embed in report (default: 2)');
   console.error('  --check-header           Include header in comparisons (stripped by default)');
@@ -166,20 +166,63 @@ async function scrollToBottom(page) {
   await page.evaluate(async () => {
     const delay = ms => new Promise(r => setTimeout(r, ms));
     const scrollHeight = () => document.body.scrollHeight;
+
+    // Scroll down in steps to trigger lazy-loaded content
     let prev = 0;
     let curr = scrollHeight();
-
     while (prev !== curr) {
       prev = curr;
       window.scrollTo(0, curr);
-      await delay(300);
+      await delay(500);
       curr = scrollHeight();
+    }
+
+    // Double-check: wait longer and verify height is truly stable
+    await delay(2000);
+    const afterWait = scrollHeight();
+    if (afterWait !== curr) {
+      // More content loaded — scroll again
+      window.scrollTo(0, afterWait);
+      await delay(1000);
     }
 
     // Scroll back to top so screenshot starts from top
     window.scrollTo(0, 0);
-    await delay(200);
+    await delay(500);
   });
+}
+
+// ─── Wait for Page Ready ─────────────────────────────────────────────────────
+
+async function waitForPageReady(page) {
+  // Wait for fonts to load
+  await page.evaluateHandle(() => document.fonts.ready);
+
+  // Wait for all images to finish loading (timeout 5s)
+  await page.evaluate(() => {
+    return new Promise(resolve => {
+      const timeout = setTimeout(resolve, 5000);
+      const imgs = Array.from(document.querySelectorAll('img'));
+      if (imgs.length === 0 || imgs.every(img => img.complete)) {
+        clearTimeout(timeout);
+        return resolve();
+      }
+      let remaining = imgs.filter(img => !img.complete).length;
+      const onDone = () => { if (--remaining <= 0) { clearTimeout(timeout); resolve(); } };
+      imgs.filter(img => !img.complete).forEach(img => {
+        img.addEventListener('load', onDone, { once: true });
+        img.addEventListener('error', onDone, { once: true });
+      });
+    });
+  });
+
+  // Layout stability check: scrollHeight must be stable across 2 reads 500ms apart
+  for (let i = 0; i < 3; i++) {
+    const h1 = await page.evaluate(() => document.body.scrollHeight);
+    await new Promise(r => setTimeout(r, 500));
+    const h2 = await page.evaluate(() => document.body.scrollHeight);
+    if (h1 === h2) break;
+  }
 }
 
 // ─── Screenshot Capture (adapted from analyze.js) ───────────────────────────
@@ -192,11 +235,48 @@ async function captureScreenshot(page, path, label) {
   try {
     ensureDir(SCREENSHOTS_DIR);
     const filename = `${safeName(path)}-${label}.png`;
+
+    // Hide stripped components so screenshots match the comparison scope
+    const hideSelectors = [];
+    if (!CHECK_HEADER) hideSelectors.push('header', '[role="banner"]', '.header', '#fern-header');
+    if (!CHECK_SIDEBAR) hideSelectors.push('.sidebar', '#fern-sidebar', '.fern-sidebar', '#fern-toc', 'aside');
+    if (!CHECK_FOOTER) hideSelectors.push('footer', '[role="contentinfo"]', '.footer', '#fern-footer', '.fern-footer');
+
+    if (hideSelectors.length > 0) {
+      await page.evaluate((selectors) => {
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach(el => {
+            el.dataset.diffHidden = el.style.display;
+            el.style.display = 'none';
+          });
+        }
+      }, hideSelectors);
+
+      // Force layout flush and wait one frame for reflow to settle
+      await page.evaluate(() => {
+        void document.body.offsetHeight;
+        return new Promise(resolve => requestAnimationFrame(() => resolve()));
+      });
+    }
+
     await page.screenshot({
       path: `${SCREENSHOTS_DIR}/${filename}`,
       fullPage: true,
       type: 'png'
     });
+
+    // Restore hidden elements so page state isn't affected
+    if (hideSelectors.length > 0) {
+      await page.evaluate((selectors) => {
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach(el => {
+            el.style.display = el.dataset.diffHidden || '';
+            delete el.dataset.diffHidden;
+          });
+        }
+      }, hideSelectors);
+    }
+
     return filename;
   } catch (e) {
     return null;
@@ -210,32 +290,37 @@ function generateScreenshotDiff(prodFile, previewFile, path) {
     const prodPng = PNG.sync.read(fs.readFileSync(`${SCREENSHOTS_DIR}/${prodFile}`));
     const previewPng = PNG.sync.read(fs.readFileSync(`${SCREENSHOTS_DIR}/${previewFile}`));
 
-    // Use the larger dimensions so both images fit
+    // Compare only the overlapping region (min dimensions) so height
+    // mismatches from lazy-loading don't create giant red blocks.
+    // Track the extra pixels separately.
     const width = Math.max(prodPng.width, previewPng.width);
-    const height = Math.max(prodPng.height, previewPng.height);
+    const compareHeight = Math.min(prodPng.height, previewPng.height);
+    const maxHeight = Math.max(prodPng.height, previewPng.height);
 
-    // Pad smaller image with white pixels to match dimensions
-    function padImage(png, w, h) {
+    // Crop/pad both images to (width x compareHeight) for the comparison
+    function cropImage(png, w, h) {
       if (png.width === w && png.height === h) return png.data;
-      const padded = Buffer.alloc(w * h * 4, 255); // white
-      for (let y = 0; y < png.height; y++) {
-        for (let x = 0; x < png.width; x++) {
+      const out = Buffer.alloc(w * h * 4, 0);
+      const copyW = Math.min(png.width, w);
+      const copyH = Math.min(png.height, h);
+      for (let y = 0; y < copyH; y++) {
+        for (let x = 0; x < copyW; x++) {
           const srcIdx = (y * png.width + x) * 4;
           const dstIdx = (y * w + x) * 4;
-          padded[dstIdx] = png.data[srcIdx];
-          padded[dstIdx + 1] = png.data[srcIdx + 1];
-          padded[dstIdx + 2] = png.data[srcIdx + 2];
-          padded[dstIdx + 3] = png.data[srcIdx + 3];
+          out[dstIdx] = png.data[srcIdx];
+          out[dstIdx + 1] = png.data[srcIdx + 1];
+          out[dstIdx + 2] = png.data[srcIdx + 2];
+          out[dstIdx + 3] = png.data[srcIdx + 3];
         }
       }
-      return padded;
+      return out;
     }
 
-    const prodData = padImage(prodPng, width, height);
-    const previewData = padImage(previewPng, width, height);
+    const prodData = cropImage(prodPng, width, compareHeight);
+    const previewData = cropImage(previewPng, width, compareHeight);
 
-    const diff = new PNG({ width, height });
-    const mismatchedPixels = pixelmatch(prodData, previewData, diff.data, width, height, {
+    const diff = new PNG({ width, height: compareHeight });
+    const mismatchedPixels = pixelmatch(prodData, previewData, diff.data, width, compareHeight, {
       threshold: 0.1,
       diffColor: [255, 0, 0],
       alpha: 0.3
@@ -244,10 +329,14 @@ function generateScreenshotDiff(prodFile, previewFile, path) {
     const diffFilename = `${safeName(path)}-diff.png`;
     fs.writeFileSync(`${SCREENSHOTS_DIR}/${diffFilename}`, PNG.sync.write(diff));
 
-    const totalPixels = width * height;
-    const diffPercent = ((mismatchedPixels / totalPixels) * 100).toFixed(2);
+    // Calculate diff percent against the comparable area only
+    const comparePixels = width * compareHeight;
+    const diffPercent = comparePixels > 0 ? ((mismatchedPixels / comparePixels) * 100).toFixed(2) : '0.00';
 
-    return { filename: diffFilename, mismatchedPixels, totalPixels, diffPercent };
+    // Note height difference if any
+    const heightDiff = maxHeight - compareHeight;
+
+    return { filename: diffFilename, mismatchedPixels, totalPixels: comparePixels, diffPercent, heightDiff };
   } catch (e) {
     return null;
   }
@@ -292,9 +381,9 @@ async function extractPageContent(page) {
       '.table-of-contents', '.toc',
       'script', 'style', 'noscript'
     ];
-    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header');
-    if (!checkSidebar) removeSelectors.push('.sidebar');
-    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer');
+    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header', '#fern-header');
+    if (!checkSidebar) removeSelectors.push('.sidebar', '#fern-sidebar', '.fern-sidebar', '#fern-toc', 'aside');
+    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer', '#fern-footer', '.fern-footer');
 
     for (const sel of removeSelectors) {
       clone.querySelectorAll(sel).forEach(el => el.remove());
@@ -362,9 +451,9 @@ async function extractDOMStructure(page) {
       '.table-of-contents', '.toc',
       'script', 'style', 'noscript'
     ];
-    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header');
-    if (!checkSidebar) removeSelectors.push('.sidebar');
-    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer');
+    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header', '#fern-header');
+    if (!checkSidebar) removeSelectors.push('.sidebar', '#fern-sidebar', '.fern-sidebar', '#fern-toc', 'aside');
+    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer', '#fern-footer', '.fern-footer');
 
     // Semantic tags we care about
     const semanticTags = new Set([
@@ -519,13 +608,12 @@ function classifyPage(textDiff, structureDiff, error) {
 async function analyzePageDiff(browser, path) {
   const prodUrl = PROD_URL + path;
   const previewUrl = PREVIEW_URL + path;
-  let page;
+  let prodPage, previewPage;
 
   try {
-    page = await browser.newPage();
-
-    // ── Production page ──
-    const prodResponse = await navigateWithRetry(page, prodUrl);
+    // ── Production page (isolated tab) ──
+    prodPage = await browser.newPage();
+    const prodResponse = await navigateWithRetry(prodPage, prodUrl);
     const prodStatus = prodResponse.status();
 
     if (prodStatus >= 400) {
@@ -538,13 +626,17 @@ async function analyzePageDiff(browser, path) {
       };
     }
 
-    await scrollToBottom(page);
-    const prodText = await extractPageContent(page);
-    const prodStructure = await extractDOMStructure(page);
-    const prodScreenshot = await captureScreenshot(page, path, 'prod');
+    await scrollToBottom(prodPage);
+    await waitForPageReady(prodPage);
+    const prodText = await extractPageContent(prodPage);
+    const prodStructure = await extractDOMStructure(prodPage);
+    const prodScreenshot = await captureScreenshot(prodPage, path, 'prod');
+    await prodPage.close();
+    prodPage = null;
 
-    // ── Preview page ──
-    const previewResponse = await navigateWithRetry(page, previewUrl);
+    // ── Preview page (isolated tab) ──
+    previewPage = await browser.newPage();
+    const previewResponse = await navigateWithRetry(previewPage, previewUrl);
     const previewStatus = previewResponse.status();
 
     if (previewStatus >= 400) {
@@ -557,10 +649,13 @@ async function analyzePageDiff(browser, path) {
       };
     }
 
-    await scrollToBottom(page);
-    const previewText = await extractPageContent(page);
-    const previewStructure = await extractDOMStructure(page);
-    const previewScreenshot = await captureScreenshot(page, path, 'preview');
+    await scrollToBottom(previewPage);
+    await waitForPageReady(previewPage);
+    const previewText = await extractPageContent(previewPage);
+    const previewStructure = await extractDOMStructure(previewPage);
+    const previewScreenshot = await captureScreenshot(previewPage, path, 'preview');
+    await previewPage.close();
+    previewPage = null;
 
     // ── Compute diffs ──
     const textDiff = computeTextDiff(prodText, previewText);
@@ -576,7 +671,8 @@ async function analyzePageDiff(browser, path) {
     const label = classification === 'unchanged' ? colors.green :
                   classification === 'text-changed' ? colors.yellow :
                   colors.red;
-    const diffPct = screenshotDiff ? ` (${screenshotDiff.diffPercent}% pixels differ)` : '';
+    const heightNote = screenshotDiff && screenshotDiff.heightDiff ? ` +${screenshotDiff.heightDiff}px height diff` : '';
+    const diffPct = screenshotDiff ? ` (${screenshotDiff.diffPercent}% pixels differ${heightNote})` : '';
     console.log(`  ${label}${classification}${colors.reset} ${path}${diffPct}`);
 
     return {
@@ -596,8 +692,11 @@ async function analyzePageDiff(browser, path) {
       textDiff: null, structureDiff: null
     };
   } finally {
-    if (page) {
-      try { await page.close(); } catch (e) {}
+    if (prodPage) {
+      try { await prodPage.close(); } catch (e) {}
+    }
+    if (previewPage) {
+      try { await previewPage.close(); } catch (e) {}
     }
 
     completedCount++;
@@ -756,7 +855,8 @@ function generateReportHTML(isLive = false) {
     const hasScreenshots = r.prodScreenshot || r.previewScreenshot;
 
     if (r.screenshotDiff) {
-      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ`);
+      const heightNote = r.screenshotDiff.heightDiff ? ` <span class="stat-dim">(+${r.screenshotDiff.heightDiff}px height)</span>` : '';
+      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ${heightNote}`);
     }
 
     return `
@@ -1251,12 +1351,18 @@ function generateShareableReport() {
 
   console.log(`Embedding diff images for ${embedCandidates.length} pages with >${DIFF_THRESHOLD}% pixel diff...`);
 
-  // Only embed the diff overlay image (not prod/preview — those are just links)
+  // Embed prod, preview, and diff images for side-by-side comparison
   const originals = new Map();
   for (const r of embedCandidates) {
-    originals.set(r, { _diffDataUri: r._diffDataUri });
+    originals.set(r, { _diffDataUri: r._diffDataUri, _prodDataUri: r._prodDataUri, _previewDataUri: r._previewDataUri });
     if (r.screenshotDiff) {
       r._diffDataUri = embedImage(`${SCREENSHOTS_DIR}/${r.screenshotDiff.filename}`);
+    }
+    if (r.prodScreenshot) {
+      r._prodDataUri = embedImage(`${SCREENSHOTS_DIR}/${r.prodScreenshot}`);
+    }
+    if (r.previewScreenshot) {
+      r._previewDataUri = embedImage(`${SCREENSHOTS_DIR}/${r.previewScreenshot}`);
     }
   }
 
@@ -1266,6 +1372,8 @@ function generateShareableReport() {
   // Restore
   for (const [r, orig] of originals) {
     r._diffDataUri = orig._diffDataUri;
+    r._prodDataUri = orig._prodDataUri;
+    r._previewDataUri = orig._previewDataUri;
   }
 
   const filename = `upgrade-diff-share-${TIMESTAMP}.html`;
@@ -1295,7 +1403,8 @@ function generateShareableHTML() {
       diffStats.push(`<span class="stat-add">+${r.structureDiff.added}</span> <span class="stat-remove">-${r.structureDiff.removed}</span> structure lines`);
     }
     if (r.screenshotDiff) {
-      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ`);
+      const heightNote = r.screenshotDiff.heightDiff ? ` <span class="stat-dim">(+${r.screenshotDiff.heightDiff}px height)</span>` : '';
+      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ${heightNote}`);
     }
 
     const textDiffHTML = r.textDiff && r.textDiff.hasChanges
@@ -1304,7 +1413,9 @@ function generateShareableHTML() {
       ? renderCompactDiffHTML(r.structureDiff.hunks) : '<div class="diff-empty">No structure differences</div>';
 
     const diffSrc = r._diffDataUri || '';
-    const hasDiffImage = !!diffSrc;
+    const prodSrc = r._prodDataUri || '';
+    const previewSrc = r._previewDataUri || '';
+    const hasScreenshots = !!(prodSrc || previewSrc || diffSrc);
 
     return `
     <div class="card classification-${r.classification}" data-classification="${r.classification}">
@@ -1325,17 +1436,29 @@ function generateShareableHTML() {
         <div class="tabs">
           <button class="tab active" onclick="switchTab(${idx}, 'text')">Text Diff</button>
           <button class="tab" onclick="switchTab(${idx}, 'structure')">Structure Diff</button>
-          ${hasDiffImage ? `<button class="tab" onclick="switchTab(${idx}, 'screenshots')">Visual Diff</button>` : ''}
+          ${hasScreenshots ? `<button class="tab" onclick="switchTab(${idx}, 'screenshots')">Visual Diff</button>` : ''}
         </div>
         <div class="tab-content" id="tab-text-${idx}">${textDiffHTML}</div>
         <div class="tab-content" id="tab-structure-${idx}" style="display:none">${structDiffHTML}</div>
-        ${hasDiffImage ? `
+        ${hasScreenshots ? `
         <div class="tab-content" id="tab-screenshots-${idx}" style="display:none">
-          <div class="screenshot-col screenshot-diff-col" style="max-width:800px">
-            <h4>Pixel Diff — ${r.screenshotDiff ? r.screenshotDiff.diffPercent : '?'}% changed (red = different)</h4>
-            <img src="${diffSrc}" loading="lazy" alt="Screenshot diff">
+          <div class="screenshots-grid-3">
+            ${prodSrc ? `
+            <div class="screenshot-col">
+              <h4>Production</h4>
+              <img src="${prodSrc}" loading="lazy" alt="Production screenshot">
+            </div>` : ''}
+            ${previewSrc ? `
+            <div class="screenshot-col">
+              <h4>Preview</h4>
+              <img src="${previewSrc}" loading="lazy" alt="Preview screenshot">
+            </div>` : ''}
+            ${diffSrc ? `
+            <div class="screenshot-col screenshot-diff-col">
+              <h4>Diff (${r.screenshotDiff ? r.screenshotDiff.diffPercent : '?'}% changed)</h4>
+              <img src="${diffSrc}" loading="lazy" alt="Screenshot diff">
+            </div>` : ''}
           </div>
-          <p style="margin-top:8px;font-size:12px;color:#8b949e;">Open the Production and Preview links above to compare side-by-side in your browser.</p>
         </div>` : ''}
       </div>
     </div>`;
@@ -1551,7 +1674,8 @@ async function main() {
     console.log('Launching browser...\n');
     const browser = await puppeteer.launch({
       headless: true,
-      defaultViewport: { width: 1280, height: 800 }
+      defaultViewport: { width: 1536, height: 960 },
+      args: ['--disable-gpu', '--disable-dev-shm-usage']
     });
 
     // Create initial live report

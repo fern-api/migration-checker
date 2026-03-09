@@ -1,13 +1,18 @@
 name: 'Docs Migration Diff'
-description: 'Compare documentation sites and report visual/structural/text differences'
+description: 'Compare production docs against a Fern preview deployment and report visual/structural/text differences'
 
 inputs:
   production-url:
-    description: 'Production docs URL (e.g. https://docs.example.com)'
+    description: 'Production docs URL (e.g. https://developers.webflow.com)'
     required: true
   preview-url:
-    description: 'Preview/staging docs URL to compare against production'
-    required: true
+    description: 'Preview docs URL (if not provided, runs fern generate --docs --preview to get one)'
+    required: false
+    default: ''
+  fern-token:
+    description: 'Fern token for generating preview (required if preview-url is not provided)'
+    required: false
+    default: ''
   sitemap-url:
     description: 'Custom sitemap URL (defaults to production-url/sitemap.xml)'
     required: false
@@ -37,6 +42,14 @@ inputs:
     required: false
     default: 'false'
 
+outputs:
+  preview-url:
+    description: 'The preview URL used for comparison'
+    value: ${{ steps.resolve-preview.outputs.preview-url }}
+  has-changes:
+    description: 'Whether any pages have changes (true/false)'
+    value: ${{ steps.run-diff.outputs.has-changes }}
+
 runs:
   using: 'composite'
   steps:
@@ -45,16 +58,41 @@ runs:
       with:
         node-version: '20'
 
-    - name: Install dependencies
+    - name: Install diff tool dependencies
       shell: bash
       run: npm ci
       working-directory: ${{ github.action_path }}
 
+    - name: Resolve preview URL
+      id: resolve-preview
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.preview-url }}" ]; then
+          echo "preview-url=${{ inputs.preview-url }}" >> "$GITHUB_OUTPUT"
+          echo "Using provided preview URL: ${{ inputs.preview-url }}"
+        else
+          echo "No preview URL provided — generating via Fern CLI..."
+          npm install -g fern-api
+          OUTPUT=$(fern generate --docs --preview 2>&1) || true
+          echo "$OUTPUT"
+          URL=$(echo "$OUTPUT" | grep -oP 'Published docs to \K.*(?= \()')
+          if [ -z "$URL" ]; then
+            echo "::error::Failed to extract preview URL from fern output"
+            exit 1
+          fi
+          echo "preview-url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Generated preview URL: $URL"
+        fi
+      env:
+        FERN_TOKEN: ${{ inputs.fern-token }}
+
     - name: Run docs diff
+      id: run-diff
       shell: bash
       working-directory: ${{ github.action_path }}
       run: |
-        ARGS="${{ inputs.production-url }} ${{ inputs.preview-url }}"
+        PREVIEW_URL="${{ steps.resolve-preview.outputs.preview-url }}"
+        ARGS="${{ inputs.production-url }} $PREVIEW_URL"
 
         if [ -n "${{ inputs.sitemap-url }}" ]; then
           ARGS="$ARGS ${{ inputs.sitemap-url }}"
@@ -83,6 +121,17 @@ runs:
 
         node upgrade-diff.js $ARGS
 
+        # Set output from CI summary
+        if [ -f upgrade-diff-ci-summary.json ]; then
+          STRUCT=$(jq '.counts.structureChanged' upgrade-diff-ci-summary.json)
+          TEXT=$(jq '.counts.textChanged' upgrade-diff-ci-summary.json)
+          if [ "$((STRUCT + TEXT))" -gt 0 ]; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+          fi
+        fi
+
     - name: Upload report artifact
       if: always()
       uses: actions/upload-artifact@v4
@@ -101,25 +150,21 @@ runs:
           const fs = require('fs');
           const path = require('path');
 
-          // Read CI summary
-          const summaryFiles = fs.readdirSync('${{ github.action_path }}')
-            .filter(f => f === 'upgrade-diff-ci-summary.json');
-
-          if (summaryFiles.length === 0) {
+          const summaryPath = path.join('${{ github.action_path }}', 'upgrade-diff-ci-summary.json');
+          if (!fs.existsSync(summaryPath)) {
             core.warning('No CI summary found — skipping PR comment');
             return;
           }
 
-          const summary = JSON.parse(
-            fs.readFileSync(path.join('${{ github.action_path }}', summaryFiles[0]), 'utf8')
-          );
-
+          const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
           const { counts, changedPages } = summary;
           const total = counts.total;
           const hasChanges = counts.structureChanged + counts.textChanged > 0;
+          const previewUrl = '${{ steps.resolve-preview.outputs.preview-url }}';
 
-          // Build summary table
           let body = `## Docs Diff Report\n\n`;
+          body += `**Production:** ${{ inputs.production-url }}\n`;
+          body += `**Preview:** ${previewUrl}\n\n`;
           body += `| Category | Count |\n`;
           body += `|----------|-------|\n`;
           body += `| Structure Changed | ${counts.structureChanged} |\n`;
@@ -145,7 +190,6 @@ runs:
 
           body += `📎 Full HTML report available as a [build artifact](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
 
-          // Find and update existing comment or create new one
           const marker = '<!-- docs-diff-report -->';
           body = marker + '\n' + body;
 
