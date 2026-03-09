@@ -199,7 +199,7 @@ By default, the tool strips headers, sidebars, and footers from comparisons to f
 
 ### GitHub Action
 
-This tool can run as a GitHub Action on pull requests. Add it to your workflow:
+This tool runs as a GitHub Action on pull requests. It integrates with Fern's preview deployments — if you don't provide a `preview-url`, it automatically runs `fern generate --docs --preview` to create one.
 
 ```yaml
 # .github/workflows/docs-diff.yml
@@ -219,26 +219,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./
         with:
-          production-url: ${{ vars.DOCS_PRODUCTION_URL }}
-          preview-url: ${{ vars.DOCS_PREVIEW_URL }}
+          production-url: https://developers.webflow.com
+          fern-token: ${{ secrets.FERN_TOKEN }}
 ```
 
-**Required repository variables:**
+**Inputs:**
 
-| Variable | Description |
-|----------|-------------|
-| `DOCS_PRODUCTION_URL` | Production docs URL |
-| `DOCS_PREVIEW_URL` | Preview/staging docs URL |
+| Input | Required | Description |
+|-------|----------|-------------|
+| `production-url` | Yes | Production docs URL |
+| `fern-token` | If no `preview-url` | Fern token for generating preview |
+| `preview-url` | No | Explicit preview URL (skips Fern preview generation) |
+| `filter` | No | Path filter pattern |
+| `concurrency` | No | Parallel comparisons (default: `10`) |
+| `diff-threshold` | No | Pixel diff threshold (default: `2`) |
+| `check-header` | No | Include header (default: `false`) |
+| `check-sidebar` | No | Include sidebar (default: `false`) |
+| `check-footer` | No | Include footer (default: `false`) |
 
-**Optional repository variables:**
+**Outputs:**
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DOCS_DIFF_FILTER` | Path filter pattern | (all pages) |
-| `DOCS_DIFF_CONCURRENCY` | Parallel comparisons | `10` |
-| `DOCS_DIFF_THRESHOLD` | Pixel diff threshold | `2` |
-| `DOCS_CHECK_HEADER` | Include header | `false` |
-| `DOCS_CHECK_SIDEBAR` | Include sidebar | `false` |
-| `DOCS_CHECK_FOOTER` | Include footer | `false` |
+| Output | Description |
+|--------|-------------|
+| `preview-url` | The preview URL used for comparison |
+| `has-changes` | `true` if any pages have structural or text changes |
 
 The action posts a summary comment on the PR with a table of changes and a link to the full HTML report artifact.
