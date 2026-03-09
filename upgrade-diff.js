@@ -166,19 +166,29 @@ async function scrollToBottom(page) {
   await page.evaluate(async () => {
     const delay = ms => new Promise(r => setTimeout(r, ms));
     const scrollHeight = () => document.body.scrollHeight;
+
+    // Scroll down in steps to trigger lazy-loaded content
     let prev = 0;
     let curr = scrollHeight();
-
     while (prev !== curr) {
       prev = curr;
       window.scrollTo(0, curr);
-      await delay(300);
+      await delay(500);
       curr = scrollHeight();
+    }
+
+    // Double-check: wait longer and verify height is truly stable
+    await delay(2000);
+    const afterWait = scrollHeight();
+    if (afterWait !== curr) {
+      // More content loaded — scroll again
+      window.scrollTo(0, afterWait);
+      await delay(1000);
     }
 
     // Scroll back to top so screenshot starts from top
     window.scrollTo(0, 0);
-    await delay(200);
+    await delay(500);
   });
 }
 
@@ -192,11 +202,42 @@ async function captureScreenshot(page, path, label) {
   try {
     ensureDir(SCREENSHOTS_DIR);
     const filename = `${safeName(path)}-${label}.png`;
+
+    // Hide stripped components so screenshots match the comparison scope
+    const hideSelectors = [];
+    if (!CHECK_HEADER) hideSelectors.push('header', '[role="banner"]', '.header', '#fern-header');
+    if (!CHECK_SIDEBAR) hideSelectors.push('.sidebar', '#fern-sidebar', '.fern-sidebar', '#fern-toc', 'aside');
+    if (!CHECK_FOOTER) hideSelectors.push('footer', '[role="contentinfo"]', '.footer', '#fern-footer', '.fern-footer');
+
+    if (hideSelectors.length > 0) {
+      await page.evaluate((selectors) => {
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach(el => {
+            el.dataset.diffHidden = el.style.display;
+            el.style.display = 'none';
+          });
+        }
+      }, hideSelectors);
+    }
+
     await page.screenshot({
       path: `${SCREENSHOTS_DIR}/${filename}`,
       fullPage: true,
       type: 'png'
     });
+
+    // Restore hidden elements so page state isn't affected
+    if (hideSelectors.length > 0) {
+      await page.evaluate((selectors) => {
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach(el => {
+            el.style.display = el.dataset.diffHidden || '';
+            delete el.dataset.diffHidden;
+          });
+        }
+      }, hideSelectors);
+    }
+
     return filename;
   } catch (e) {
     return null;
@@ -210,32 +251,37 @@ function generateScreenshotDiff(prodFile, previewFile, path) {
     const prodPng = PNG.sync.read(fs.readFileSync(`${SCREENSHOTS_DIR}/${prodFile}`));
     const previewPng = PNG.sync.read(fs.readFileSync(`${SCREENSHOTS_DIR}/${previewFile}`));
 
-    // Use the larger dimensions so both images fit
+    // Compare only the overlapping region (min dimensions) so height
+    // mismatches from lazy-loading don't create giant red blocks.
+    // Track the extra pixels separately.
     const width = Math.max(prodPng.width, previewPng.width);
-    const height = Math.max(prodPng.height, previewPng.height);
+    const compareHeight = Math.min(prodPng.height, previewPng.height);
+    const maxHeight = Math.max(prodPng.height, previewPng.height);
 
-    // Pad smaller image with white pixels to match dimensions
-    function padImage(png, w, h) {
+    // Crop/pad both images to (width x compareHeight) for the comparison
+    function cropImage(png, w, h) {
       if (png.width === w && png.height === h) return png.data;
-      const padded = Buffer.alloc(w * h * 4, 255); // white
-      for (let y = 0; y < png.height; y++) {
-        for (let x = 0; x < png.width; x++) {
+      const out = Buffer.alloc(w * h * 4, 0);
+      const copyW = Math.min(png.width, w);
+      const copyH = Math.min(png.height, h);
+      for (let y = 0; y < copyH; y++) {
+        for (let x = 0; x < copyW; x++) {
           const srcIdx = (y * png.width + x) * 4;
           const dstIdx = (y * w + x) * 4;
-          padded[dstIdx] = png.data[srcIdx];
-          padded[dstIdx + 1] = png.data[srcIdx + 1];
-          padded[dstIdx + 2] = png.data[srcIdx + 2];
-          padded[dstIdx + 3] = png.data[srcIdx + 3];
+          out[dstIdx] = png.data[srcIdx];
+          out[dstIdx + 1] = png.data[srcIdx + 1];
+          out[dstIdx + 2] = png.data[srcIdx + 2];
+          out[dstIdx + 3] = png.data[srcIdx + 3];
         }
       }
-      return padded;
+      return out;
     }
 
-    const prodData = padImage(prodPng, width, height);
-    const previewData = padImage(previewPng, width, height);
+    const prodData = cropImage(prodPng, width, compareHeight);
+    const previewData = cropImage(previewPng, width, compareHeight);
 
-    const diff = new PNG({ width, height });
-    const mismatchedPixels = pixelmatch(prodData, previewData, diff.data, width, height, {
+    const diff = new PNG({ width, height: compareHeight });
+    const mismatchedPixels = pixelmatch(prodData, previewData, diff.data, width, compareHeight, {
       threshold: 0.1,
       diffColor: [255, 0, 0],
       alpha: 0.3
@@ -244,10 +290,14 @@ function generateScreenshotDiff(prodFile, previewFile, path) {
     const diffFilename = `${safeName(path)}-diff.png`;
     fs.writeFileSync(`${SCREENSHOTS_DIR}/${diffFilename}`, PNG.sync.write(diff));
 
-    const totalPixels = width * height;
-    const diffPercent = ((mismatchedPixels / totalPixels) * 100).toFixed(2);
+    // Calculate diff percent against the comparable area only
+    const comparePixels = width * compareHeight;
+    const diffPercent = comparePixels > 0 ? ((mismatchedPixels / comparePixels) * 100).toFixed(2) : '0.00';
 
-    return { filename: diffFilename, mismatchedPixels, totalPixels, diffPercent };
+    // Note height difference if any
+    const heightDiff = maxHeight - compareHeight;
+
+    return { filename: diffFilename, mismatchedPixels, totalPixels: comparePixels, diffPercent, heightDiff };
   } catch (e) {
     return null;
   }
@@ -292,9 +342,9 @@ async function extractPageContent(page) {
       '.table-of-contents', '.toc',
       'script', 'style', 'noscript'
     ];
-    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header');
-    if (!checkSidebar) removeSelectors.push('.sidebar');
-    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer');
+    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header', '#fern-header');
+    if (!checkSidebar) removeSelectors.push('.sidebar', '#fern-sidebar', '.fern-sidebar', '#fern-toc', 'aside');
+    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer', '#fern-footer', '.fern-footer');
 
     for (const sel of removeSelectors) {
       clone.querySelectorAll(sel).forEach(el => el.remove());
@@ -362,9 +412,9 @@ async function extractDOMStructure(page) {
       '.table-of-contents', '.toc',
       'script', 'style', 'noscript'
     ];
-    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header');
-    if (!checkSidebar) removeSelectors.push('.sidebar');
-    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer');
+    if (!checkHeader) removeSelectors.push('header', '[role="banner"]', '.header', '#fern-header');
+    if (!checkSidebar) removeSelectors.push('.sidebar', '#fern-sidebar', '.fern-sidebar', '#fern-toc', 'aside');
+    if (!checkFooter) removeSelectors.push('footer', '[role="contentinfo"]', '.footer', '#fern-footer', '.fern-footer');
 
     // Semantic tags we care about
     const semanticTags = new Set([
@@ -576,7 +626,8 @@ async function analyzePageDiff(browser, path) {
     const label = classification === 'unchanged' ? colors.green :
                   classification === 'text-changed' ? colors.yellow :
                   colors.red;
-    const diffPct = screenshotDiff ? ` (${screenshotDiff.diffPercent}% pixels differ)` : '';
+    const heightNote = screenshotDiff && screenshotDiff.heightDiff ? ` +${screenshotDiff.heightDiff}px height diff` : '';
+    const diffPct = screenshotDiff ? ` (${screenshotDiff.diffPercent}% pixels differ${heightNote})` : '';
     console.log(`  ${label}${classification}${colors.reset} ${path}${diffPct}`);
 
     return {
@@ -756,7 +807,8 @@ function generateReportHTML(isLive = false) {
     const hasScreenshots = r.prodScreenshot || r.previewScreenshot;
 
     if (r.screenshotDiff) {
-      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ`);
+      const heightNote = r.screenshotDiff.heightDiff ? ` <span class="stat-dim">(+${r.screenshotDiff.heightDiff}px height)</span>` : '';
+      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ${heightNote}`);
     }
 
     return `
@@ -1295,7 +1347,8 @@ function generateShareableHTML() {
       diffStats.push(`<span class="stat-add">+${r.structureDiff.added}</span> <span class="stat-remove">-${r.structureDiff.removed}</span> structure lines`);
     }
     if (r.screenshotDiff) {
-      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ`);
+      const heightNote = r.screenshotDiff.heightDiff ? ` <span class="stat-dim">(+${r.screenshotDiff.heightDiff}px height)</span>` : '';
+      diffStats.push(`<span class="stat-remove">${r.screenshotDiff.diffPercent}%</span> pixels differ${heightNote}`);
     }
 
     const textDiffHTML = r.textDiff && r.textDiff.hasChanges
